@@ -1,55 +1,89 @@
 
 pub use super::base::*;
 use rand::Rng;
+use std::borrow::BorrowMut;
 //use std::io::Read;
-//use std::sync::{Arc, Weak, RwLock};
+use std::sync::{Arc, Weak, RwLock};
+use std::cell::RefCell;
 use std::collections::{HashMap,HashSet};
 
+/// NEAT сеть, состоящая из нескольких подсетей, связанных послойно
+#[derive(Deserialize, Serialize, Debug)]
 pub struct Nets {
-    max_node: NodeIndex,
-    pub nodes: HashSet<NodeIndex>,//65536 узлов
-    max_link: LinkIndex,
-    pub links: HashSet<LinkIndex>,//4 млрд связей
-    pub layers: Vec<DenseNet>,//все сети 
+    pub max_node: RwLock<NodeIndex>,
+    //pub nodes: RwLock<HashSet<NodeIndex>>,//65536 узлов
+    pub max_link: RwLock<LinkIndex>,
+    //pub links: RwLock<HashSet<LinkIndex>>,//4 млрд связей
+    pub layers: RwLock<Vec<DenseNet>>,//все сети 
 }
 
 impl Nets {
-    pub fn new() -> Self {
+    pub fn new() -> Arc<Self> {
+        Arc::new(
         Nets {
-            max_node: 0,
-            nodes: HashSet::new(),
-            max_link: 0,
-            links: HashSet::new(),
-            layers: Vec::new(),
-        }
+            max_node: RwLock::new(0),
+            //nodes: RwLock::new(HashSet::new()),
+            max_link: RwLock::new(0),
+            //links: RwLock::new(HashSet::new()),
+            layers: RwLock::new(Vec::new()),
+        })
     }
 }
 
+/// Полносвязанная подсеть
+#[derive(Deserialize, Serialize, Debug)]
 pub struct DenseNet {
-    pub nodes: HashMap<NodeIndex,DenseNode>,//
+    pub parent_net: Weak<Nets>,//ссылка на родительскую NEAT-сеть
+    pub nodes: HashMap<NodeIndex, DenseNode>,//узлы подсети
+    pub links: HashMap<LinkIndex, NodesLink>,//связи между узлами
 }
 
-    // /// добавить новый узел (для нового узла пишем id = 0)
-    // pub fn ins_node(&mut self, id: NodeId, node_type: NodeType, activation: Activation) -> NodeId {
-    //     if id.index() == 0 {
-    //         // добавляем новый узел. id указываем = 0. инкрементируем max_node
-    //         self.max_node = NodeId::new(self.max_node.index() + 1);
-    //         let n = Arc::new(RwLock::new(Node::new(self.max_node, node_type, activation)));
-    //         self.nodes.insert(self.max_node, Arc::clone(&n));  
-    //         self.max_node
-    //     }
-    //     else 
-    //     if let Some(_nid) = self.nodes.iter().find(|nid| nid.0.index() == id.index()) {
-    //         //такой узел уже есть, возвращаем 0;
-    //         NodeId::new(0)
-    //     } else  {
-    //         //такого узла не найдено, добавим новый с указанным NodeId
-    //         if self.max_node.index() < id.index() { self.max_node = id };
-    //         let n = Arc::new(RwLock::new(Node::new(id, node_type, activation)));
-    //         self.nodes.insert(id, Arc::clone(&n));  
-    //         id  
-    //     }
-    // }
+impl DenseNet {
+    pub fn new(parent: Arc<Nets>) -> Self {
+        DenseNet {
+            parent_net: Arc::downgrade(&parent),
+            nodes: HashMap::new(),
+            links: HashMap::new(),
+        }
+    }
+
+    /// добавить новый узел (для нового узла пишем id = 0)
+    pub fn ins_node(&mut self, id: NodeIndex, node_type: NodeType, activation: Activation) -> NodeIndex {
+        let mut lv_max_node: NodeIndex = 0;
+        let lo_dense_net = Arc::new(*self);//ссылка на себя как на родителя
+        if id == 0 {
+            // добавляем новый узел. id указываем = 0. инкрементируем max_node
+            if let Some(parent) = self.parent_net.upgrade() {
+                if let Ok(max_node) = parent.max_node.write() {
+                    *max_node += 1;
+                    lv_max_node = *max_node;
+                    let lo_net = DenseNode::new(lv_max_node, lo_dense_net, node_type, activation);
+                    self.nodes.insert(lv_max_node, lo_net); 
+                }
+            } 
+            lv_max_node
+        }
+        else 
+        if let Some(_nid) = self.nodes.iter().find(|nid| *nid.0 == id) {
+            //такой узел уже есть, возвращаем 0;
+            0
+        } else  {
+            //такого узла не найдено, добавим новый с указанным NodeId
+            if let Some(parent) = self.parent_net.upgrade() {
+                if let Ok(max_node) = parent.max_node.write() {
+                    if *max_node < id {*max_node = id};
+                    lv_max_node = id;
+                    
+
+                }
+            }
+            if self.max_node.index() < id.index() { self.max_node = id };
+            let n = Arc::new(RwLock::new(Node::new(id, node_type, activation)));
+            self.nodes.insert(id, Arc::clone(&n));  
+            id  
+        }
+    }
+}
     // /// связать узлы (src - откуда, dst - куда). перед связыванием надо проверять на возможность!
     // pub fn link_nodes(&mut self, src: NodeId, dst: NodeId, weight: f32, enabled: bool) -> LinkId {
     //     //инкрементируем max_link
@@ -134,7 +168,8 @@ pub struct DenseNet {
 pub struct DenseNode {
     pub id: NodeIndex,//исторический индекс узла
     //outgoing: Vec<Weak<RwLock<NodesLink>>>,//список связей смотрящих из узла
-    incoming: Vec<NodesLink>,//связи, смотрящие на узел
+    parent_net: Weak<DenseNet>,//ссылка на родительскую подсеть
+    incoming: Vec<LinkIndex>,//связи, смотрящие на узел (индексы связей из родительской подсети DenseNet.links)
     activation: Activation,//функция активации
     pub node_type: NodeType,//тип узла
     pub activated_value: f32,//значение после активации
@@ -147,10 +182,11 @@ pub struct DenseNode {
 }
 
 impl DenseNode {
-    pub fn new(id: NodeIndex, node_type: NodeType, activation: Activation) -> Self {
+    pub fn new(id: NodeIndex, parent: Arc<DenseNet>, node_type: NodeType, activation: Activation) -> Self {
         DenseNode {
             id,
             //outgoing: Vec::new(),
+            parent_net: Arc::downgrade(&parent),
             incoming: Vec::new(),
             activation,
             node_type,
@@ -165,7 +201,7 @@ impl DenseNode {
     }
 
     /// добавляем связь на нас
-    pub fn add_incoming(&mut self, link: NodesLink) {
+    pub fn add_incoming(&mut self, link: LinkIndex) {
         self.incoming.push(link);
     }
 
